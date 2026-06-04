@@ -1,0 +1,9 @@
+# YOLOv5 License Plate Dataset Configuration
+# Usage: python train.py --data ccpd.yaml
+
+path: /home/alientek/mynpu/rk3588_linux_release/external/rknn-toolkit2/rknn-toolkit2/examples/pytorch/mycar_plate/dataset
+train: images/train
+val: images/val
+
+nc: 1
+names: ['LP']

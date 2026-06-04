@@ -1,0 +1,37 @@
+# Python
+__pycache__/
+*.py[cod]
+*.so
+*.egg-info/
+.eggs/
+dist/
+build/
+
+# Datasets & large data
+dataset/
+test_data/
+model/
+
+# Training output
+runs/
+**/weights/
+
+# Training output
+runs/
+**/weights/
+
+# ONNX files (can be regenerated)
+check0_base_optimize.onnx
+check2_correct_ops.onnx
+check3_fuse_ops.onnx
+
+# Jupyter
+.ipynb_checkpoints/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
