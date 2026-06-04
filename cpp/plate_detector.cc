@@ -8,9 +8,14 @@
 #include "file_utils.h"
 #include "opencv2/opencv.hpp"
 
-#define OBJ_THRESH  0.5f
-#define NMS_THRESH  0.45f
+/* ---------- 检测阈值 ---------- */
+#define OBJ_THRESH  0.5f   /* 置信度阈值，低于该值的检测框被过滤 */
+#define NMS_THRESH  0.45f  /* NMS 的 IoU 阈值，高于该值的重叠框被抑制 */
 
+/**
+ * 打印张量属性（调试用）
+ * 显示索引、名称、维度、格式、数据类型、量化参数等
+ */
 static void dump_tensor_attr(rknn_tensor_attr *attr)
 {
     printf("  index=%d, name=%s, n_dims=%d, dims=[%d, %d, %d, %d], n_elems=%d, "
@@ -22,11 +27,19 @@ static void dump_tensor_attr(rknn_tensor_attr *attr)
            get_qnt_type_string(attr->qnt_type), attr->zp, attr->scale);
 }
 
+/** 浮点数裁剪，将 val 限制在 [min, max] 区间 */
 static float clamp(float val, float min, float max)
 {
     return fmax(fmin(val, max), min);
 }
 
+/**
+ * 非极大值抑制（NMS）
+ * @param dets  候选框列表（会被排序）
+ * @param keep  [out] 保留的框索引
+ *
+ * 算法：按置信度降序排序 → 依次选取最高分框 → 与后续框计算 IoU → 超过阈值则抑制
+ */
 static int nms_boxes(std::vector<plate_det_result_t> &dets, std::vector<int> &keep)
 {
     std::vector<int> order(dets.size());
@@ -68,6 +81,16 @@ static int nms_boxes(std::vector<plate_det_result_t> &dets, std::vector<int> &ke
     return 0;
 }
 
+/**
+ * 初始化车牌检测器
+ *
+ * 步骤说明：
+ *   1. read_data_from_file 读取 RKNN 模型文件到内存
+ *   2. rknn_init 将模型加载到 NPU，返回上下文句柄
+ *   3. rknn_query IN_OUT_NUM / INPUT_ATTR / OUTPUT_ATTR 获取张量信息
+ *   4. 解析输入尺寸（支持 NCHW / NHWC 两种排布）
+ *   5. 将输入输出属性 malloc 复制到 ctx，供后续推理使用
+ */
 int init_plate_detector(const char *model_path, plate_detector_context_t *ctx)
 {
     int ret;
@@ -159,6 +182,21 @@ int init_plate_detector(const char *model_path, plate_detector_context_t *ctx)
     return 0;
 }
 
+/**
+ * 执行车牌检测推理
+ *
+ * 预处理：
+ *   - 将输入图 letterbox resize 到模型输入尺寸（保持宽高比，灰边填充）
+ *   - 填充色使用 YOLO 系列惯例 RGB(114,114,114)
+ *
+ * NPU 推理：
+ *   - 输入 uint8 NHWC，输出 float
+ *
+ * 后处理（解码 [N,6] 格式输出）：
+ *   - 每个检测框 6 个值：[cx, cy, w, h, conf, cls]
+ *   - 置信度过滤 → 去除 letterbox padding → 缩放回原图坐标 → 坐标裁剪
+ *   - NMS 去重 → 输出到 results
+ */
 int inference_plate_detector(plate_detector_context_t *ctx, image_buffer_t *src_img,
                              plate_det_results_t *results)
 {
@@ -172,10 +210,9 @@ int inference_plate_detector(plate_detector_context_t *ctx, image_buffer_t *src_
     memset(inputs, 0, sizeof(inputs));
     memset(outputs, 0, sizeof(outputs));
 
-    // Convert image_buffer_t to OpenCV Mat (data is RGB888)
+    /* ===== Letterbox 预处理 ===== */
     cv::Mat src_mat(src_img->height, src_img->width, CV_8UC3, src_img->virt_addr);
 
-    // Letterbox resize and keep as RGB
     float scale = std::min((float)model_w / src_mat.cols, (float)model_h / src_mat.rows);
     int new_w = (int)(src_mat.cols * scale);
     int new_h = (int)(src_mat.rows * scale);
@@ -188,7 +225,7 @@ int inference_plate_detector(plate_detector_context_t *ctx, image_buffer_t *src_
     cv::Mat padded(model_h, model_w, CV_8UC3, cv::Scalar(114, 114, 114));
     resized.copyTo(padded(cv::Rect(pad_w, pad_h, new_w, new_h)));
 
-    // Set input (raw [0,255] values, NHWC)
+    /* ===== NPU 推理 ===== */
     inputs[0].index = 0;
     inputs[0].type = RKNN_TENSOR_UINT8;
     inputs[0].fmt = RKNN_TENSOR_NHWC;
@@ -217,7 +254,7 @@ int inference_plate_detector(plate_detector_context_t *ctx, image_buffer_t *src_
         return -1;
     }
 
-    // Post-process: decode [1, N, 6] format: [cx, cy, w, h, conf, cls]
+    /* ===== 后处理 ===== */
     float *data = (float *)outputs[0].buf;
     int num_dets = ctx->output_attrs[0].dims[1];
 
@@ -234,7 +271,7 @@ int inference_plate_detector(plate_detector_context_t *ctx, image_buffer_t *src_
         float w  = data[i * 6 + 2];
         float h  = data[i * 6 + 3];
 
-        // Center to corner, remove padding, scale, clip
+        /* 中心坐标 → 左上右下，并反算 letterbox 到原图 */
         float x1 = ((cx - w / 2.0f) - pad_w) / scale;
         float y1 = ((cy - h / 2.0f) - pad_h) / scale;
         float x2 = ((cx + w / 2.0f) - pad_w) / scale;
@@ -254,7 +291,7 @@ int inference_plate_detector(plate_detector_context_t *ctx, image_buffer_t *src_
         candidates.push_back(det);
     }
 
-    // NMS
+    /* NMS */
     std::vector<int> keep;
     nms_boxes(candidates, keep);
 
@@ -269,6 +306,7 @@ int inference_plate_detector(plate_detector_context_t *ctx, image_buffer_t *src_
     return 0;
 }
 
+/** 释放检测器：释放 attrs 内存，销毁 RKNN 上下文 */
 int release_plate_detector(plate_detector_context_t *ctx)
 {
     if (ctx->input_attrs != NULL)

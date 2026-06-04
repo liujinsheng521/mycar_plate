@@ -8,6 +8,14 @@
 #include "file_utils.h"
 #include "opencv2/opencv.hpp"
 
+/**
+ * 中国车牌字符集（按 LPRNet 训练索引顺序）
+ *   0-30: 省份简称（31 个）
+ *  31-40: 数字 0-9
+ *  41-65: 字母 A-Z（去掉 I、O）
+ *    66:  字母 I
+ *    67:  字母 O / CTC blank 符
+ */
 static const char *CHARS[] = {
     "京","沪","津","渝","冀","晋","蒙","辽","吉","黑",
     "苏","浙","皖","闽","赣","鲁","豫","鄂","湘","粤",
@@ -17,8 +25,14 @@ static const char *CHARS[] = {
     "L","M","N","P","Q","R","S","T","U","V",
     "W","X","Y","Z","I","O","-"};
 #define CHARS_NUM 68
-#define PLATE_MAX_LEN 18
+#define PLATE_MAX_LEN 18 /* LPRNet 输出序列长度 */
 
+/**
+ * 初始化 LPRNet
+ *
+ * 与 init_plate_detector 流程一致：
+ * 读取模型 → rknn_init → 查询输入输出属性 → 解析模型尺寸 → 保存到 ctx
+ */
 int init_lprnet(const char *model_path, lprnet_context_t *ctx)
 {
     int ret;
@@ -74,6 +88,22 @@ int init_lprnet(const char *model_path, lprnet_context_t *ctx)
     return 0;
 }
 
+/**
+ * 执行 LPRNet 车牌字符识别
+ *
+ * 预处理：
+ *   - resize 到 LPRNet 固定输入 94x24
+ *   - RGB → BGR（LPRNet 训练时使用 BGR 格式）
+ *
+ * NPU 推理：输入 uint8 NHWC，输出 float
+ *
+ * CTC 贪心解码：
+ *   LPRNet 输出形状 [1, 68, 18]，表示 18 个时间步 × 68 个字符类别
+ *   1. 每个时间步取 argmax，得到最佳字符索引序列
+ *   2. 移除连续重复字符（CTC collapse）
+ *   3. 移除 blank 字符（索引 67）
+ *   4. 查 CHARS 表拼接为最终车牌字符串
+ */
 int inference_lprnet(lprnet_context_t *ctx, image_buffer_t *src_img, lprnet_result_t *result)
 {
     int ret;
@@ -82,12 +112,13 @@ int inference_lprnet(lprnet_context_t *ctx, image_buffer_t *src_img, lprnet_resu
     memset(inputs, 0, sizeof(inputs));
     memset(outputs, 0, sizeof(outputs));
 
-    // Preprocess: resize crop to 94x24, convert RGB->BGR (LPRNet trained on BGR)
+    /* 预处理：resize 到 94x24，RGB → BGR */
     cv::Mat img_ori(src_img->height, src_img->width, CV_8UC3, src_img->virt_addr);
     cv::Mat img_resized;
     cv::resize(img_ori, img_resized, cv::Size(94, 24));
     cv::cvtColor(img_resized, img_resized, cv::COLOR_RGB2BGR);
 
+    /* NPU 推理 */
     inputs[0].index = 0;
     inputs[0].type = RKNN_TENSOR_UINT8;
     inputs[0].fmt = RKNN_TENSOR_NHWC;
@@ -104,11 +135,10 @@ int inference_lprnet(lprnet_context_t *ctx, image_buffer_t *src_img, lprnet_resu
     ret = rknn_outputs_get(ctx->rknn_ctx, 1, outputs, NULL);
     if (ret < 0) return -1;
 
-    // Decode: output shape is [1, 68, 18] stored as [18, 68] in NHWC
+    /* CTC 解码：argmax + collapse + remove blank */
     float *out_data = (float *)outputs[0].buf;
     std::vector<int> no_repeat_blank;
 
-    // Read 18 position predictions, each with 68 class scores
     int prebs[PLATE_MAX_LEN];
     for (int x = 0; x < 18; x++) {
         int max_idx = 0;
@@ -120,7 +150,6 @@ int inference_lprnet(lprnet_context_t *ctx, image_buffer_t *src_img, lprnet_resu
         prebs[x] = max_idx;
     }
 
-    // Remove consecutive duplicates and blank char (index 67 = '-')
     int prev = prebs[0];
     if (prev != 67) no_repeat_blank.push_back(prev);
     for (int i = 0; i < 18; i++) {
@@ -141,6 +170,7 @@ int inference_lprnet(lprnet_context_t *ctx, image_buffer_t *src_img, lprnet_resu
     return 0;
 }
 
+/** 释放 LPRNet */
 int release_lprnet(lprnet_context_t *ctx)
 {
     if (ctx->input_attrs)  { free(ctx->input_attrs);  ctx->input_attrs = NULL; }
